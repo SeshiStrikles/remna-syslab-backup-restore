@@ -47,11 +47,13 @@ install_script() {
 
     # 2. Запрос данных
     echo -e "\n${YELLOW}[Настройка путей]${NC}"
-    read -p "Укажите путь к проекту VpnManager [/opt/VpnManagerEasy]: " input_dir
-    PROJECT_DIR=${input_dir:-/opt/VpnManagerEasy}
+    # ТУТ ИЗМЕНЕНО: VpnManagerEasy -> VpnManager
+    read -p "Укажите путь к проекту VpnManager [/opt/VpnManager]: " input_dir
+    PROJECT_DIR=${input_dir:-/opt/VpnManager}
     
     if [ ! -d "$PROJECT_DIR" ]; then
         echo -e "${RED}Ошибка: Директория $PROJECT_DIR не найдена!${NC}"
+        echo -e "${YELLOW}Убедитесь, что вы переименовали папку проекта в /opt/VpnManager${NC}"
         exit 1
     fi
 
