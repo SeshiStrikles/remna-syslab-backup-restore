@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# REMNA SYSLAB BACKUP & RESTORE TOOL v2.0
+# REMNA SYSLAB BACKUP & RESTORE TOOL v3.0
 # Autonomous Backup System for Dockerized VpnManager
 # ==============================================================================
 
@@ -10,8 +10,10 @@ TG_BOT_TOKEN=""
 TG_CHAT_ID=""
 TG_TOPIC_ID=""
 PROJECT_DIR="" 
+BACKUP_RETENTION_DAYS="14" # Сколько дней хранить бэкапы
 INSTALL_DIR="/opt/remna-syslab-backup-restore"
 BACKUP_DIR="/opt/remna-syslab-backup-restore/backup"
+REPO_URL="https://raw.githubusercontent.com/SeshiStrikles/remna-syslab-backup-restore/main/remna-syslab-backup-restore.sh"
 # ----------------------------------------------------------------
 
 # Цвета
@@ -28,11 +30,11 @@ fi
 # --- ФУНКЦИЯ СОХРАНЕНИЯ НАСТРОЕК ---
 save_config() {
     local target_file="$1"
-    # Используем уникальные имена переменных, чтобы избежать конфликта с .env
     sed -i "s|^TG_BOT_TOKEN=.*|TG_BOT_TOKEN=\"$TG_BOT_TOKEN\"|" "$target_file"
     sed -i "s|^TG_CHAT_ID=.*|TG_CHAT_ID=\"$TG_CHAT_ID\"|" "$target_file"
     sed -i "s|^TG_TOPIC_ID=.*|TG_TOPIC_ID=\"$TG_TOPIC_ID\"|" "$target_file"
     sed -i "s|^PROJECT_DIR=.*|PROJECT_DIR=\"$PROJECT_DIR\"|" "$target_file"
+    sed -i "s|^BACKUP_RETENTION_DAYS=.*|BACKUP_RETENTION_DAYS=\"$BACKUP_RETENTION_DAYS\"|" "$target_file"
 }
 
 # --- ИНСТАЛЛЯТОР ---
@@ -56,19 +58,56 @@ install_script() {
     read -p "Telegram BOT_TOKEN: " TG_BOT_TOKEN
     read -p "Telegram CHAT_ID: " TG_CHAT_ID
     read -p "TOPIC_ID (Enter если нет): " TG_TOPIC_ID
+    
+    read -p "Сколько дней хранить бэкапы? [14]: " ret_days
+    BACKUP_RETENTION_DAYS=${ret_days:-14}
 
     mkdir -p "$BACKUP_DIR"
 
     TARGET_SCRIPT="$INSTALL_DIR/remna-syslab-backup-restore.sh"
-    # Копируем текущий скрипт
+    mkdir -p "$INSTALL_DIR"
+    
     cp "$0" "$TARGET_SCRIPT"
     chmod +x "$TARGET_SCRIPT"
     
-    # Сохраняем переменные в целевой файл
     save_config "$TARGET_SCRIPT"
 
     echo -e "\n${GREEN}✔ Установка завершена! Запускаю...${NC}\n"
     exec "$TARGET_SCRIPT"
+}
+
+# --- САМООБНОВЛЕНИЕ ---
+self_update() {
+    echo -e "\n${YELLOW}Проверка обновлений...${NC}"
+    TMP_FILE="/tmp/remna_update.sh"
+    
+    # Скачиваем новую версию
+    if curl -sSL "$REPO_URL" -o "$TMP_FILE"; then
+        if [ ! -s "$TMP_FILE" ]; then
+            echo -e "${RED}Ошибка скачивания: файл пуст.${NC}"
+            return
+        fi
+        
+        # Проверяем, что это действительно bash скрипт
+        if ! grep -q "#!/bin/bash" "$TMP_FILE"; then
+             echo -e "${RED}Ошибка: Скачанный файл не является скриптом.${NC}"
+             return
+        fi
+
+        echo "Перенос настроек в новую версию..."
+        # Применяем текущие настройки к скачанному файлу
+        save_config "$TMP_FILE"
+        
+        # Заменяем текущий скрипт
+        mv "$TMP_FILE" "$INSTALL_DIR/remna-syslab-backup-restore.sh"
+        chmod +x "$INSTALL_DIR/remna-syslab-backup-restore.sh"
+        
+        echo -e "${GREEN}✔ Скрипт обновлен! Перезапускаю...${NC}"
+        sleep 1
+        exec "$INSTALL_DIR/remna-syslab-backup-restore.sh"
+    else
+        echo -e "${RED}Не удалось скачать обновление с GitHub.${NC}"
+    fi
 }
 
 # --- РЕДАКТОР НАСТРОЕК ---
@@ -88,6 +127,9 @@ edit_settings() {
     read -p "Topic ID [$TG_TOPIC_ID]: " new_topic
     TG_TOPIC_ID=${new_topic:-$TG_TOPIC_ID}
     
+    read -p "Хранить дней [$BACKUP_RETENTION_DAYS]: " new_ret
+    BACKUP_RETENTION_DAYS=${new_ret:-$BACKUP_RETENTION_DAYS}
+    
     save_config "$0"
     echo -e "${GREEN}✔ Настройки обновлены!${NC}"
 }
@@ -96,9 +138,6 @@ edit_settings() {
 perform_backup() {
     if [ -z "$TG_BOT_TOKEN" ]; then echo -e "${RED}Не настроен токен!${NC}"; exit 1; fi
     
-    # Загружаем .env для доступа к БД
-    # Важно: переменные из .env могут перезаписать локальные,
-    # но так как мы используем TG_BOT_TOKEN, конфликта не будет.
     if [ -f "$PROJECT_DIR/.env" ]; then
         export $(grep -v '^#' "$PROJECT_DIR/.env" | xargs)
     else
@@ -124,7 +163,10 @@ perform_backup() {
          -F caption="📦 Remna Backup: $TIMESTAMP" \
          "https://api.telegram.org/bot$TG_BOT_TOKEN/sendDocument" > /dev/null
          
-    find "$BACKUP_DIR" -name "backup_*.zip" -type f -mtime +14 -delete
+    # Очистка старых
+    echo "Очистка бэкапов старше $BACKUP_RETENTION_DAYS дней..."
+    find "$BACKUP_DIR" -name "backup_*.zip" -type f -mtime +$BACKUP_RETENTION_DAYS -delete
+    
     echo -e "${GREEN}✔ Готово.${NC}"
 }
 
@@ -150,7 +192,6 @@ perform_restore() {
     SQL_DUMP=$(find "$TEMP_RESTORE" -name "*.sql" | head -n 1)
     RESTORE_ENV="$TEMP_RESTORE/.env"
 
-    # Берем данные для БД из восстанавливаемого .env
     if [ -f "$RESTORE_ENV" ]; then export $(grep -v '^#' "$RESTORE_ENV" | xargs); fi
 
     echo "Стоп бота..."
@@ -191,7 +232,8 @@ while true; do
     echo "3. ⏰ Настроить Cron"
     echo "4. ⚙️  Показать текущие настройки"
     echo "5. 🛠  Изменить настройки"
-    echo "6. ❌ Удалить менеджер"
+    echo "6. 🔄 Обновить скрипт (с GitHub)"
+    echo "7. ❌ Удалить менеджер"
     echo "0. Выход"
     read -p "Ваш выбор: " choice
 
@@ -206,10 +248,11 @@ while true; do
         4) 
            echo -e "\nПроект: $PROJECT_DIR"
            echo "Токен: ${TG_BOT_TOKEN:0:10}..."
-           echo "Чат: $TG_CHAT_ID | Топик: $TG_TOPIC_ID"
+           echo "Хранить дней: $BACKUP_RETENTION_DAYS"
            read -p "Enter..." ;;
         5) edit_settings; read -p "Enter..." ;;
-        6) 
+        6) self_update ;;
+        7) 
            read -p "Удалить скрипт? [y/N]: " d
            if [[ "$d" == "y" ]]; then
                crontab -l | grep -v "$TARGET" | crontab -
