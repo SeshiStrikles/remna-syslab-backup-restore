@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==============================================================================
-# REMNA SYSLAB BACKUP & RESTORE TOOL v3.0
-# Autonomous Backup System for Dockerized VpnManager
+# REMNA SYSLAB BACKUP & RESTORE TOOL v3.1
+# Autonomous Backup System with Error Monitoring
 # ==============================================================================
 
 # --- КОНФИГУРАЦИЯ (Заполняется автоматически) ---
@@ -10,7 +10,7 @@ TG_BOT_TOKEN=""
 TG_CHAT_ID=""
 TG_TOPIC_ID=""
 PROJECT_DIR="" 
-BACKUP_RETENTION_DAYS="14" # Сколько дней хранить бэкапы
+BACKUP_RETENTION_DAYS="14"
 INSTALL_DIR="/opt/remna-syslab-backup-restore"
 BACKUP_DIR="/opt/remna-syslab-backup-restore/backup"
 REPO_URL="https://raw.githubusercontent.com/SeshiStrikles/remna-syslab-backup-restore/main/remna-syslab-backup-restore.sh"
@@ -35,6 +35,19 @@ save_config() {
     sed -i "s|^TG_TOPIC_ID=.*|TG_TOPIC_ID=\"$TG_TOPIC_ID\"|" "$target_file"
     sed -i "s|^PROJECT_DIR=.*|PROJECT_DIR=\"$PROJECT_DIR\"|" "$target_file"
     sed -i "s|^BACKUP_RETENTION_DAYS=.*|BACKUP_RETENTION_DAYS=\"$BACKUP_RETENTION_DAYS\"|" "$target_file"
+}
+
+# --- ФУНКЦИЯ ОТПРАВКИ ОШИБОК ---
+send_error_alert() {
+    local error_msg="$1"
+    echo -e "${RED}ERROR: $error_msg${NC}"
+    
+    # Отправляем текстовое сообщение в Telegram
+    curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
+        -d chat_id="$TG_CHAT_ID" \
+        -d message_thread_id="$TG_TOPIC_ID" \
+        -d text="❌ <b>ОШИБКА БЭКАПА!</b>%0A%0AПричина: <i>$error_msg</i>%0A%0AСервер: $(hostname)" \
+        -d parse_mode="HTML" > /dev/null
 }
 
 # --- ИНСТАЛЛЯТОР ---
@@ -81,24 +94,15 @@ self_update() {
     echo -e "\n${YELLOW}Проверка обновлений...${NC}"
     TMP_FILE="/tmp/remna_update.sh"
     
-    # Скачиваем новую версию
     if curl -sSL "$REPO_URL" -o "$TMP_FILE"; then
-        if [ ! -s "$TMP_FILE" ]; then
-            echo -e "${RED}Ошибка скачивания: файл пуст.${NC}"
-            return
-        fi
-        
-        # Проверяем, что это действительно bash скрипт
-        if ! grep -q "#!/bin/bash" "$TMP_FILE"; then
-             echo -e "${RED}Ошибка: Скачанный файл не является скриптом.${NC}"
+        if [ ! -s "$TMP_FILE" ] || ! grep -q "#!/bin/bash" "$TMP_FILE"; then
+             echo -e "${RED}Ошибка: Некорректный файл обновления.${NC}"
              return
         fi
 
         echo "Перенос настроек в новую версию..."
-        # Применяем текущие настройки к скачанному файлу
         save_config "$TMP_FILE"
         
-        # Заменяем текущий скрипт
         mv "$TMP_FILE" "$INSTALL_DIR/remna-syslab-backup-restore.sh"
         chmod +x "$INSTALL_DIR/remna-syslab-backup-restore.sh"
         
@@ -113,8 +117,6 @@ self_update() {
 # --- РЕДАКТОР НАСТРОЕК ---
 edit_settings() {
     echo -e "\n${YELLOW}=== Редактирование настроек ===${NC}"
-    echo "Нажмите Enter, чтобы оставить текущее значение."
-    
     read -p "Путь к проекту [$PROJECT_DIR]: " new_dir
     PROJECT_DIR=${new_dir:-$PROJECT_DIR}
     
@@ -136,38 +138,69 @@ edit_settings() {
 
 # --- БЭКАП ---
 perform_backup() {
-    if [ -z "$TG_BOT_TOKEN" ]; then echo -e "${RED}Не настроен токен!${NC}"; exit 1; fi
-    
-    if [ -f "$PROJECT_DIR/.env" ]; then
-        export $(grep -v '^#' "$PROJECT_DIR/.env" | xargs)
-    else
-        echo -e "${RED}.env не найден!${NC}"; exit 1
+    if [ -z "$TG_BOT_TOKEN" ]; then 
+        echo -e "${RED}Не настроен токен!${NC}"; exit 1
     fi
+    
+    # Проверка наличия .env
+    if [ ! -f "$PROJECT_DIR/.env" ]; then
+        send_error_alert "Файл .env не найден в $PROJECT_DIR"
+        exit 1
+    fi
+    
+    export $(grep -v '^#' "$PROJECT_DIR/.env" | xargs)
     
     TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
     SQL_FILE="$BACKUP_DIR/db_$TIMESTAMP.sql"
     ZIP_FILE="$BACKUP_DIR/backup_$TIMESTAMP.zip"
     
+    # 1. Дамп базы с перехватом ошибки
     echo "Дамп базы..."
-    if ! docker exec vpnmanager_postgres pg_dump -U "${DB_USER}" "${DB_NAME}" > "$SQL_FILE"; then
-        echo -e "${RED}Ошибка дампа БД!${NC}"; rm "$SQL_FILE"; exit 1
+    DUMP_OUTPUT=$(docker exec vpnmanager_postgres pg_dump -U "${DB_USER}" "${DB_NAME}" > "$SQL_FILE" 2>&1)
+    EXIT_CODE=$?
+    
+    if [ $EXIT_CODE -ne 0 ]; then
+        rm "$SQL_FILE" 2>/dev/null
+        send_error_alert "Ошибка pg_dump (Код: $EXIT_CODE). Детали: $DUMP_OUTPUT"
+        exit 1
     fi
     
+    # Проверка, что файл не пустой
+    if [ ! -s "$SQL_FILE" ]; then
+        rm "$SQL_FILE"
+        send_error_alert "Файл дампа базы пустой. Возможно, база данных пуста или повреждена."
+        exit 1
+    fi
+    
+    # 2. Архивация
     echo "Архивация..."
-    zip -j "$ZIP_FILE" "$SQL_FILE" "$PROJECT_DIR/.env" > /dev/null
+    ZIP_OUTPUT=$(zip -j "$ZIP_FILE" "$SQL_FILE" "$PROJECT_DIR/.env" 2>&1)
+    if [ $? -ne 0 ]; then
+        send_error_alert "Ошибка создания ZIP архива. Детали: $ZIP_OUTPUT"
+        rm "$SQL_FILE"
+        exit 1
+    fi
     rm "$SQL_FILE"
     
+    # 3. Отправка
     echo "Отправка в Telegram..."
-    curl -s -F chat_id="$TG_CHAT_ID" -F message_thread_id="$TG_TOPIC_ID" \
+    RESPONSE=$(curl -s -F chat_id="$TG_CHAT_ID" -F message_thread_id="$TG_TOPIC_ID" \
          -F document=@"$ZIP_FILE" \
          -F caption="📦 Remna Backup: $TIMESTAMP" \
-         "https://api.telegram.org/bot$TG_BOT_TOKEN/sendDocument" > /dev/null
+         "https://api.telegram.org/bot$TG_BOT_TOKEN/sendDocument")
          
-    # Очистка старых
+    # Проверка ответа от Telegram (есть ли "ok":true)
+    if ! echo "$RESPONSE" | grep -q '"ok":true'; then
+        send_error_alert "Ошибка загрузки файла в Telegram. Ответ API: $RESPONSE"
+        # Не удаляем файл бэкапа локально, чтобы можно было забрать руками
+        exit 1
+    fi
+         
+    # Очистка
     echo "Очистка бэкапов старше $BACKUP_RETENTION_DAYS дней..."
     find "$BACKUP_DIR" -name "backup_*.zip" -type f -mtime +$BACKUP_RETENTION_DAYS -delete
     
-    echo -e "${GREEN}✔ Готово.${NC}"
+    echo -e "${GREEN}✔ Бэкап успешно выполнен и отправлен.${NC}"
 }
 
 # --- ВОССТАНОВЛЕНИЕ ---
@@ -226,13 +259,13 @@ fi
 
 while true; do
     clear
-    echo -e "${GREEN}=== Remna SysLab Backup Manager ===${NC}"
+    echo -e "${GREEN}=== Remna SysLab Backup Manager v3.1 ===${NC}"
     echo "1. 🚀 Бэкап сейчас"
     echo "2. ♻️  Восстановить"
     echo "3. ⏰ Настроить Cron"
-    echo "4. ⚙️  Показать текущие настройки"
+    echo "4. ⚙️  Показать настройки"
     echo "5. 🛠  Изменить настройки"
-    echo "6. 🔄 Обновить скрипт (с GitHub)"
+    echo "6. 🔄 Обновить скрипт"
     echo "7. ❌ Удалить менеджер"
     echo "0. Выход"
     read -p "Ваш выбор: " choice
