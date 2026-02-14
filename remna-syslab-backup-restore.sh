@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==============================================================================
-# REMNA SYSLAB BACKUP & RESTORE TOOL v3.1
-# Autonomous Backup System with Error Monitoring
+# REMNA SYSLAB BACKUP & RESTORE TOOL v3.2
+# Autonomous Backup System with Error Monitoring & Quantity Rotation
 # ==============================================================================
 
 # --- КОНФИГУРАЦИЯ (Заполняется автоматически) ---
@@ -10,7 +10,7 @@ TG_BOT_TOKEN=""
 TG_CHAT_ID=""
 TG_TOPIC_ID=""
 PROJECT_DIR="" 
-BACKUP_RETENTION_DAYS="14"
+MAX_BACKUPS_COUNT="30" # Сколько штук хранить (не дней, а файлов)
 INSTALL_DIR="/opt/remna-syslab-backup-restore"
 BACKUP_DIR="/opt/remna-syslab-backup-restore/backup"
 REPO_URL="https://raw.githubusercontent.com/SeshiStrikles/remna-syslab-backup-restore/main/remna-syslab-backup-restore.sh"
@@ -34,7 +34,7 @@ save_config() {
     sed -i "s|^TG_CHAT_ID=.*|TG_CHAT_ID=\"$TG_CHAT_ID\"|" "$target_file"
     sed -i "s|^TG_TOPIC_ID=.*|TG_TOPIC_ID=\"$TG_TOPIC_ID\"|" "$target_file"
     sed -i "s|^PROJECT_DIR=.*|PROJECT_DIR=\"$PROJECT_DIR\"|" "$target_file"
-    sed -i "s|^BACKUP_RETENTION_DAYS=.*|BACKUP_RETENTION_DAYS=\"$BACKUP_RETENTION_DAYS\"|" "$target_file"
+    sed -i "s|^MAX_BACKUPS_COUNT=.*|MAX_BACKUPS_COUNT=\"$MAX_BACKUPS_COUNT\"|" "$target_file"
 }
 
 # --- ФУНКЦИЯ ОТПРАВКИ ОШИБОК ---
@@ -42,7 +42,6 @@ send_error_alert() {
     local error_msg="$1"
     echo -e "${RED}ERROR: $error_msg${NC}"
     
-    # Отправляем текстовое сообщение в Telegram
     curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
         -d chat_id="$TG_CHAT_ID" \
         -d message_thread_id="$TG_TOPIC_ID" \
@@ -72,8 +71,8 @@ install_script() {
     read -p "Telegram CHAT_ID: " TG_CHAT_ID
     read -p "TOPIC_ID (Enter если нет): " TG_TOPIC_ID
     
-    read -p "Сколько дней хранить бэкапы? [14]: " ret_days
-    BACKUP_RETENTION_DAYS=${ret_days:-14}
+    read -p "Сколько последних бэкапов хранить? [30]: " max_cnt
+    MAX_BACKUPS_COUNT=${max_cnt:-30}
 
     mkdir -p "$BACKUP_DIR"
 
@@ -129,8 +128,8 @@ edit_settings() {
     read -p "Topic ID [$TG_TOPIC_ID]: " new_topic
     TG_TOPIC_ID=${new_topic:-$TG_TOPIC_ID}
     
-    read -p "Хранить дней [$BACKUP_RETENTION_DAYS]: " new_ret
-    BACKUP_RETENTION_DAYS=${new_ret:-$BACKUP_RETENTION_DAYS}
+    read -p "Хранить штук [$MAX_BACKUPS_COUNT]: " new_max
+    MAX_BACKUPS_COUNT=${new_max:-$MAX_BACKUPS_COUNT}
     
     save_config "$0"
     echo -e "${GREEN}✔ Настройки обновлены!${NC}"
@@ -142,7 +141,6 @@ perform_backup() {
         echo -e "${RED}Не настроен токен!${NC}"; exit 1
     fi
     
-    # Проверка наличия .env
     if [ ! -f "$PROJECT_DIR/.env" ]; then
         send_error_alert "Файл .env не найден в $PROJECT_DIR"
         exit 1
@@ -154,7 +152,6 @@ perform_backup() {
     SQL_FILE="$BACKUP_DIR/db_$TIMESTAMP.sql"
     ZIP_FILE="$BACKUP_DIR/backup_$TIMESTAMP.zip"
     
-    # 1. Дамп базы с перехватом ошибки
     echo "Дамп базы..."
     DUMP_OUTPUT=$(docker exec vpnmanager_postgres pg_dump -U "${DB_USER}" "${DB_NAME}" > "$SQL_FILE" 2>&1)
     EXIT_CODE=$?
@@ -165,42 +162,48 @@ perform_backup() {
         exit 1
     fi
     
-    # Проверка, что файл не пустой
     if [ ! -s "$SQL_FILE" ]; then
         rm "$SQL_FILE"
-        send_error_alert "Файл дампа базы пустой. Возможно, база данных пуста или повреждена."
+        send_error_alert "Файл дампа базы пустой."
         exit 1
     fi
     
-    # 2. Архивация
     echo "Архивация..."
     ZIP_OUTPUT=$(zip -j "$ZIP_FILE" "$SQL_FILE" "$PROJECT_DIR/.env" 2>&1)
     if [ $? -ne 0 ]; then
-        send_error_alert "Ошибка создания ZIP архива. Детали: $ZIP_OUTPUT"
+        send_error_alert "Ошибка ZIP. Детали: $ZIP_OUTPUT"
         rm "$SQL_FILE"
         exit 1
     fi
     rm "$SQL_FILE"
     
-    # 3. Отправка
     echo "Отправка в Telegram..."
     RESPONSE=$(curl -s -F chat_id="$TG_CHAT_ID" -F message_thread_id="$TG_TOPIC_ID" \
          -F document=@"$ZIP_FILE" \
          -F caption="📦 Remna Backup: $TIMESTAMP" \
          "https://api.telegram.org/bot$TG_BOT_TOKEN/sendDocument")
          
-    # Проверка ответа от Telegram (есть ли "ok":true)
     if ! echo "$RESPONSE" | grep -q '"ok":true'; then
-        send_error_alert "Ошибка загрузки файла в Telegram. Ответ API: $RESPONSE"
-        # Не удаляем файл бэкапа локально, чтобы можно было забрать руками
+        send_error_alert "Ошибка API Telegram: $RESPONSE"
         exit 1
     fi
          
-    # Очистка
-    echo "Очистка бэкапов старше $BACKUP_RETENTION_DAYS дней..."
-    find "$BACKUP_DIR" -name "backup_*.zip" -type f -mtime +$BACKUP_RETENTION_DAYS -delete
+    # --- РОТАЦИЯ ПО КОЛИЧЕСТВУ ---
+    # Переходим в папку бэкапов
+    cd "$BACKUP_DIR" || exit
+    # Считаем файлы zip
+    COUNT=$(ls -1 backup_*.zip 2>/dev/null | wc -l)
     
-    echo -e "${GREEN}✔ Бэкап успешно выполнен и отправлен.${NC}"
+    if [ "$COUNT" -gt "$MAX_BACKUPS_COUNT" ]; then
+        echo "Чистка старых бэкапов (Лимит: $MAX_BACKUPS_COUNT, Сейчас: $COUNT)..."
+        # ls -1t: сортировка по времени (новые сверху)
+        # tail -n +X: берем все файлы начиная с (Limit+1) - то есть старые
+        # xargs rm: удаляем их
+        ls -1t backup_*.zip | tail -n +$((MAX_BACKUPS_COUNT + 1)) | xargs rm -f
+        echo "Старые копии удалены."
+    fi
+    
+    echo -e "${GREEN}✔ Бэкап успешно выполнен.${NC}"
 }
 
 # --- ВОССТАНОВЛЕНИЕ ---
@@ -208,7 +211,8 @@ perform_restore() {
     if [ -z "$(ls -A $BACKUP_DIR)" ]; then echo -e "${RED}Нет бэкапов!${NC}"; return; fi
     
     echo -e "\n${YELLOW}Доступные бэкапы:${NC}"
-    ls -1 "$BACKUP_DIR" | grep ".zip"
+    ls -1t "$BACKUP_DIR" | grep ".zip" | head -n 10
+    echo "... (показаны последние 10)"
     echo ""
     read -p "Имя файла: " BACKUP_NAME
     FULL_PATH="$BACKUP_DIR/$BACKUP_NAME"
@@ -259,7 +263,7 @@ fi
 
 while true; do
     clear
-    echo -e "${GREEN}=== Remna SysLab Backup Manager v3.1 ===${NC}"
+    echo -e "${GREEN}=== Remna SysLab Backup Manager v3.2 ===${NC}"
     echo "1. 🚀 Бэкап сейчас"
     echo "2. ♻️  Восстановить"
     echo "3. ⏰ Настроить Cron"
@@ -281,7 +285,7 @@ while true; do
         4) 
            echo -e "\nПроект: $PROJECT_DIR"
            echo "Токен: ${TG_BOT_TOKEN:0:10}..."
-           echo "Хранить дней: $BACKUP_RETENTION_DAYS"
+           echo "Хранить штук: $MAX_BACKUPS_COUNT"
            read -p "Enter..." ;;
         5) edit_settings; read -p "Enter..." ;;
         6) self_update ;;
