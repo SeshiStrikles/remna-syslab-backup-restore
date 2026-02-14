@@ -28,4 +28,4 @@
 Зайдите на сервер по SSH и выполните команду (требуются права `sudo` или root):
 
 ```bash
-curl -sSL [https://raw.githubusercontent.com/SeshiStrikles/remna-syslab-backup-restore/main/remna-syslab-backup-restore.sh](https://raw.githubusercontent.com/SeshiStrikles/remna-syslab-backup-restore/main/remna-syslab-backup-restore.sh) -o install_backup.sh && chmod +x install_backup.sh && sudo ./install_backup.sh
+curl -sSL https://raw.githubusercontent.com/SeshiStrikles/remna-syslab-backup-restore/main/remna-syslab-backup-restore.sh -o install_backup.sh && chmod +x install_backup.sh && sudo ./install_backup.sh
