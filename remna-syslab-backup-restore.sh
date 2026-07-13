@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# REMNA SYSLAB BACKUP & RESTORE TOOL v3.2
+# REMNA SYSLAB BACKUP & RESTORE TOOL v3.3
 # Autonomous Backup System with Error Monitoring & Quantity Rotation
 # ==============================================================================
 
@@ -153,7 +153,7 @@ perform_backup() {
     ZIP_FILE="$BACKUP_DIR/backup_$TIMESTAMP.zip"
     
     echo "Дамп базы..."
-    DUMP_OUTPUT=$(docker exec vpnmanager_postgres pg_dump -U "${DB_USER}" "${DB_NAME}" > "$SQL_FILE" 2>&1)
+    DUMP_OUTPUT=$(docker exec vpnmanager_postgres pg_dump -U "${DB_USER}" --clean --if-exists "${DB_NAME}" > "$SQL_FILE" 2>&1)
     EXIT_CODE=$?
     
     if [ $EXIT_CODE -ne 0 ]; then
@@ -233,6 +233,9 @@ perform_restore() {
 
     echo "Стоп бота..."
     docker compose -f "$PROJECT_DIR/docker-compose.yml" stop bot
+
+    echo "Очистка текущей структуры БД..."
+    docker exec -i vpnmanager_postgres psql -U "${DB_USER}" -d "${DB_NAME}" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO \"${DB_USER}\"; GRANT ALL ON SCHEMA public TO public;"
 
     echo "Заливка базы..."
     cat "$SQL_DUMP" | docker exec -i vpnmanager_postgres psql -U "${DB_USER}" -d "${DB_NAME}"
