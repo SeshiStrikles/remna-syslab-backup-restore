@@ -266,7 +266,7 @@ fi
 
 while true; do
     clear
-    echo -e "${GREEN}=== Remna SysLab Backup Manager v3.2 ===${NC}"
+    echo -e "${GREEN}=== Remna SysLab Backup Manager v3.3 ===${NC}"
     echo "1. 🚀 Бэкап сейчас"
     echo "2. ♻️  Восстановить"
     echo "3. ⏰ Настроить Cron"
