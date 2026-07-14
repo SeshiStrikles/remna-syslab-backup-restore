@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# REMNA SYSLAB BACKUP & RESTORE TOOL v3.3
+# REMNA SYSLAB BACKUP & RESTORE TOOL v3.4 (Bulletproof DB Auth & Overwrite)
 # Autonomous Backup System with Error Monitoring & Quantity Rotation
 # ==============================================================================
 
@@ -10,7 +10,7 @@ TG_BOT_TOKEN=""
 TG_CHAT_ID=""
 TG_TOPIC_ID=""
 PROJECT_DIR="" 
-MAX_BACKUPS_COUNT="30" # Сколько штук хранить (не дней, а файлов)
+MAX_BACKUPS_COUNT="30"
 INSTALL_DIR="/opt/remna-syslab-backup-restore"
 BACKUP_DIR="/opt/remna-syslab-backup-restore/backup"
 REPO_URL="https://raw.githubusercontent.com/SeshiStrikles/remna-syslab-backup-restore/main/remna-syslab-backup-restore.sh"
@@ -27,7 +27,6 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# --- ФУНКЦИЯ СОХРАНЕНИЯ НАСТРОЕК ---
 save_config() {
     local target_file="$1"
     sed -i "s|^TG_BOT_TOKEN=.*|TG_BOT_TOKEN=\"$TG_BOT_TOKEN\"|" "$target_file"
@@ -37,7 +36,6 @@ save_config() {
     sed -i "s|^MAX_BACKUPS_COUNT=.*|MAX_BACKUPS_COUNT=\"$MAX_BACKUPS_COUNT\"|" "$target_file"
 }
 
-# --- ФУНКЦИЯ ОТПРАВКИ ОШИБОК ---
 send_error_alert() {
     local error_msg="$1"
     echo -e "${RED}ERROR: $error_msg${NC}"
@@ -49,7 +47,6 @@ send_error_alert() {
         -d parse_mode="HTML" > /dev/null
 }
 
-# --- ИНСТАЛЛЯТОР ---
 install_script() {
     echo -e "${GREEN}=== Установка Remna SysLab Backup Tool ===${NC}"
     
@@ -75,20 +72,17 @@ install_script() {
     MAX_BACKUPS_COUNT=${max_cnt:-30}
 
     mkdir -p "$BACKUP_DIR"
-
     TARGET_SCRIPT="$INSTALL_DIR/remna-syslab-backup-restore.sh"
     mkdir -p "$INSTALL_DIR"
     
     cp "$0" "$TARGET_SCRIPT"
     chmod +x "$TARGET_SCRIPT"
-    
     save_config "$TARGET_SCRIPT"
 
     echo -e "\n${GREEN}✔ Установка завершена! Запускаю...${NC}\n"
     exec "$TARGET_SCRIPT"
 }
 
-# --- САМООБНОВЛЕНИЕ ---
 self_update() {
     echo -e "\n${YELLOW}Проверка обновлений...${NC}"
     TMP_FILE="/tmp/remna_update.sh"
@@ -98,10 +92,7 @@ self_update() {
              echo -e "${RED}Ошибка: Некорректный файл обновления.${NC}"
              return
         fi
-
-        echo "Перенос настроек в новую версию..."
         save_config "$TMP_FILE"
-        
         mv "$TMP_FILE" "$INSTALL_DIR/remna-syslab-backup-restore.sh"
         chmod +x "$INSTALL_DIR/remna-syslab-backup-restore.sh"
         
@@ -113,7 +104,6 @@ self_update() {
     fi
 }
 
-# --- РЕДАКТОР НАСТРОЕК ---
 edit_settings() {
     echo -e "\n${YELLOW}=== Редактирование настроек ===${NC}"
     read -p "Путь к проекту [$PROJECT_DIR]: " new_dir
@@ -135,7 +125,6 @@ edit_settings() {
     echo -e "${GREEN}✔ Настройки обновлены!${NC}"
 }
 
-# --- БЭКАП ---
 perform_backup() {
     if [ -z "$TG_BOT_TOKEN" ]; then 
         echo -e "${RED}Не настроен токен!${NC}"; exit 1
@@ -153,7 +142,8 @@ perform_backup() {
     ZIP_FILE="$BACKUP_DIR/backup_$TIMESTAMP.zip"
     
     echo "Дамп базы..."
-    DUMP_OUTPUT=$(docker exec vpnmanager_postgres pg_dump -U "${DB_USER}" --clean --if-exists "${DB_NAME}" > "$SQL_FILE" 2>&1)
+    # ДОБАВЛЕН ФЛАГ --no-owner чтобы бекапы больше не привязывались к конкретному юзеру
+    DUMP_OUTPUT=$(docker exec vpnmanager_postgres pg_dump -U postgres --clean --no-owner "${DB_NAME}" > "$SQL_FILE" 2>&1)
     EXIT_CODE=$?
     
     if [ $EXIT_CODE -ne 0 ]; then
@@ -188,17 +178,11 @@ perform_backup() {
         exit 1
     fi
          
-    # --- РОТАЦИЯ ПО КОЛИЧЕСТВУ ---
-    # Переходим в папку бэкапов
     cd "$BACKUP_DIR" || exit
-    # Считаем файлы zip
     COUNT=$(ls -1 backup_*.zip 2>/dev/null | wc -l)
     
     if [ "$COUNT" -gt "$MAX_BACKUPS_COUNT" ]; then
         echo "Чистка старых бэкапов (Лимит: $MAX_BACKUPS_COUNT, Сейчас: $COUNT)..."
-        # ls -1t: сортировка по времени (новые сверху)
-        # tail -n +X: берем все файлы начиная с (Limit+1) - то есть старые
-        # xargs rm: удаляем их
         ls -1t backup_*.zip | tail -n +$((MAX_BACKUPS_COUNT + 1)) | xargs rm -f
         echo "Старые копии удалены."
     fi
@@ -206,7 +190,6 @@ perform_backup() {
     echo -e "${GREEN}✔ Бэкап успешно выполнен.${NC}"
 }
 
-# --- ВОССТАНОВЛЕНИЕ ---
 perform_restore() {
     if [ -z "$(ls -A $BACKUP_DIR)" ]; then echo -e "${RED}Нет бэкапов!${NC}"; return; fi
     
@@ -234,11 +217,19 @@ perform_restore() {
     echo "Стоп бота..."
     docker compose -f "$PROJECT_DIR/docker-compose.yml" stop bot
 
-    echo "Очистка текущей структуры БД..."
-    docker exec -i vpnmanager_postgres psql -U "${DB_USER}" -d "${DB_NAME}" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO \"${DB_USER}\"; GRANT ALL ON SCHEMA public TO public;"
+    echo "Подготовка БД и восстановление прав..."
+    # 1. Создаем пользователя из .env, если его нет (ошибки игнорируются)
+    docker exec -i vpnmanager_postgres psql -U postgres -c "CREATE USER \"${DB_USER}\" WITH PASSWORD '${DB_PASSWORD}';" 2>/dev/null
+    
+    # 2. Очищаем схему и отдаем её нужному пользователю
+    docker exec -i vpnmanager_postgres psql -U postgres -d "${DB_NAME}" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public; ALTER SCHEMA public OWNER TO \"${DB_USER}\";"
 
+    # 3. Восстанавливаем дамп
     echo "Заливка базы..."
-    cat "$SQL_DUMP" | docker exec -i vpnmanager_postgres psql -U "${DB_USER}" -d "${DB_NAME}"
+    cat "$SQL_DUMP" | docker exec -i vpnmanager_postgres psql -U postgres -d "${DB_NAME}" > /dev/null 2>&1
+
+    # 4. Принудительно раздаем полные права на все восстановленные таблицы пользователю из .env
+    docker exec -i vpnmanager_postgres psql -U postgres -d "${DB_NAME}" -c "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO \"${DB_USER}\"; GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO \"${DB_USER}\";"
 
     read -p "Восстановить файл .env? [y/N]: " r_env
     if [[ "$r_env" == "y" ]]; then cp "$RESTORE_ENV" "$PROJECT_DIR/.env"; fi
@@ -248,8 +239,6 @@ perform_restore() {
     rm -rf "$TEMP_RESTORE"
     echo -e "${GREEN}✔ Восстановлено.${NC}"
 }
-
-# --- ЛОГИКА ЗАПУСКА ---
 
 if [[ "$1" == "--auto" ]]; then
     perform_backup
@@ -266,7 +255,7 @@ fi
 
 while true; do
     clear
-    echo -e "${GREEN}=== Remna SysLab Backup Manager v3.3 ===${NC}"
+    echo -e "${GREEN}=== Remna SysLab Backup Manager v3.4 ===${NC}"
     echo "1. 🚀 Бэкап сейчас"
     echo "2. ♻️  Восстановить"
     echo "3. ⏰ Настроить Cron"
