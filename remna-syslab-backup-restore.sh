@@ -229,7 +229,11 @@ perform_restore() {
     SQL_DUMP=$(find "$TEMP_RESTORE" -name "*.sql" | head -n 1)
     RESTORE_ENV="$TEMP_RESTORE/.env"
 
-    if [ -f "$RESTORE_ENV" ]; then export $(grep -v '^#' "$RESTORE_ENV" | xargs); fi
+    if [ -f "$RESTORE_ENV" ]; then
+    set -a
+    . "$RESTORE_ENV"
+    set +a
+    fi
 
     echo "Стоп бота..."
     docker compose -f "$PROJECT_DIR/docker-compose.yml" stop bot
